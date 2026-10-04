@@ -963,6 +963,59 @@ def test_daemon_refuses_second_instance(tmp_path):
     first.pidfile.release()
 
 
+# =============================================================== 故障注入
+
+def test_proxy_injector_rejects_double_start():
+    """回归：SO_REUSEADDR 在 Linux 上不允许重复绑定，在 Windows 上却允许 ——
+    于是"重复 start"这个 bug 只在 Linux CI 上炸。现在显式报错，两边行为一致。"""
+    from opslab import chaos
+    proxy = chaos.ProxyInjector("p", target_port=_free_port(), listen_port=_free_port())
+    proxy.start()
+    try:
+        with pytest.raises(RuntimeError):
+            proxy.start()
+        assert proxy.active is True
+    finally:
+        proxy.stop()
+    assert proxy.active is False
+    # 停掉之后可以再起（修复流程要用到）
+    proxy.start()
+    try:
+        assert proxy.active is True
+    finally:
+        proxy.stop()
+
+
+def test_proxy_fault_applies_without_restarting_infrastructure():
+    """注入故障只改参数，不重启代理"""
+    from opslab import chaos
+    proxy = chaos.ProxyInjector("p", target_port=_free_port(), listen_port=_free_port())
+    proxy.start()
+    try:
+        fault = chaos.ProxyFault("latency", proxy, latency_ms=800.0)
+        fault.start()
+        assert proxy.latency_ms == 800.0 and proxy.active is True
+        fault.stop()
+        assert proxy.latency_ms == 0.0 and proxy.active is True   # 代理本身没被重启
+        # 代理没起来时必须明确报错，而不是静默不生效
+        proxy.stop()
+        with pytest.raises(RuntimeError):
+            chaos.ProxyFault("hang", proxy, hang=True).start()
+    finally:
+        proxy.stop()
+
+
+def test_injector_kinds_and_scenarios_are_wired():
+    from opslab import chaos
+    names = [s.name for s in chaos.SCENARIOS]
+    assert names == ["service_killed", "service_hung", "network_latency",
+                     "http_errors", "cpu_saturation"]
+    # 每个场景都要有检测时间与恢复时间的上界（否则"演练"就没有判据）
+    for scenario in chaos.SCENARIOS:
+        assert scenario.detect_bound_ms > 0 and scenario.recover_bound_ms > 0
+        assert scenario.description
+
+
 # =============================================================== 工具
 
 class _FakeClock(object):

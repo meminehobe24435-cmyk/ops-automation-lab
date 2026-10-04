@@ -76,6 +76,12 @@ class ProxyInjector(Injector):
         self.injected_errors = 0
 
     def start(self) -> None:
+        if self.active:
+            # 幂等保护：SO_REUSEADDR 在 **Linux 上不允许**两个 socket 绑同一个 addr:port
+            # （那是 SO_REUSEPORT 的语义），第二次 bind 会抛 OSError；但在 Windows 上
+            # SO_REUSEADDR 允许重复绑定、还会把端口"抢"过去 —— 于是同一个 bug
+            # 在 Windows 上"看起来能用"、在 Linux CI 上直接挂。所以这里显式报错。
+            raise RuntimeError("代理 %s 已在监听 %d，不要重复启动" % (self.name, self.listen_port))
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", self.listen_port))
@@ -85,6 +91,7 @@ class ProxyInjector(Injector):
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
         self.active = True
+        self.started_at = self.clock()
 
     def _accept_loop(self):
         while not self._stop.is_set():
@@ -159,6 +166,44 @@ class ProxyInjector(Injector):
                 pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        self._sock = None
+        self._thread = None
+
+
+class ProxyFault(Injector):
+    """**在运行中的代理上就地改故障参数** —— 注入故障不该重启基础设施。
+
+    `ProxyInjector` 是在每条新连接建立时才读 `latency_ms / error_rate / hang`，
+    所以直接改这三个属性就立即对新连接生效，**不需要重启代理**。
+
+    ⚠️ 第一版这里图省事，直接又调了一次 `proxy.start()`，结果在 Windows 上能跑
+    （SO_REUSEADDR 允许重复绑定），在 Linux 上一次都跑不起来（bind 直接 OSError）。
+    这种"只有某个平台才复现"的 bug 正是跨平台 CI 的价值所在。
+    """
+
+    kind = "proxy"
+
+    def __init__(self, name: str, proxy: ProxyInjector, latency_ms: float = 0.0,
+                 error_rate: float = 0.0, hang: bool = False):
+        Injector.__init__(self, name, proxy.target_port, proxy.listen_port)
+        self.proxy = proxy
+        self.latency_ms = float(latency_ms)
+        self.error_rate = float(error_rate)
+        self.hang = bool(hang)
+
+    def start(self) -> None:
+        if not self.proxy.active:
+            raise RuntimeError("代理还没起来，无法注入故障")
+        self.proxy.latency_ms = self.latency_ms
+        self.proxy.error_rate = self.error_rate
+        self.proxy.hang = self.hang
+        self.active = True
+
+    def stop(self) -> None:
+        self.proxy.latency_ms = 0.0
+        self.proxy.error_rate = 0.0
+        self.proxy.hang = False
+        self.active = False
 
 
 class KillInjector(Injector):
@@ -294,13 +339,14 @@ class Drill(object):
             return KillInjector("kill", managed)
         if proxy is None:
             raise RuntimeError("该场景需要代理注入器")
+        # 就地改参数，不重启代理（见 ProxyFault 的说明）
         if scenario.name == "service_hung":
-            proxy.hang = True
-        elif scenario.name == "network_latency":
-            proxy.latency_ms = 800.0
-        elif scenario.name == "http_errors":
-            proxy.error_rate = 1.0
-        return proxy
+            return ProxyFault("hang", proxy, hang=True)
+        if scenario.name == "network_latency":
+            return ProxyFault("latency", proxy, latency_ms=800.0)
+        if scenario.name == "http_errors":
+            return ProxyFault("errors", proxy, error_rate=1.0)
+        raise RuntimeError("未知场景：%s" % scenario.name)
 
     def _remediation_steps(self, scenario: Scenario, managed: procs.ManagedProcess,
                            proxy: Optional[ProxyInjector], probe_port: int) -> Playbook:
