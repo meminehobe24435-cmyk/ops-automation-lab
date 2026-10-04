@@ -11,7 +11,8 @@ services:
     build: .
     image: ops-automation-lab:local
     container_name: opslab-demo
-    command: ["demo-service", "--port", "18080", "--version", "compose-v1"]
+    # ⚠️ --host 0.0.0.0 必须显式写：容器里绑 127.0.0.1 端口映射会失效
+    command: ["demo-service", "--port", "18080", "--host", "0.0.0.0", "--version", "compose-v1"]
     ports:
       - "18080:18080"
     healthcheck:

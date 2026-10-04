@@ -143,7 +143,8 @@ def cmd_deploy(args) -> int:
 
 def cmd_demo(args) -> int:
     from .demo import service
-    return service.main(["--port", str(args.port), "--version", args.version])
+    return service.main(["--port", str(args.port), "--host", args.host,
+                         "--version", args.version])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -199,6 +200,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("demo-service", help="起示例服务")
     p.add_argument("--port", type=int, default=18080)
+    # ⚠️ 在容器里必须绑 0.0.0.0：绑 127.0.0.1 的话端口只对容器**内部**可见，
+    #    `-p 18080:18080` 映射进来的连接会被 docker-proxy 直接重置（curl 报 56）。
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--version", default="v1")
     p.set_defaults(func=cmd_demo)
     return parser

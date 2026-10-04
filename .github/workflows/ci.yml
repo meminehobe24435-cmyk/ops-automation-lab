@@ -131,10 +131,22 @@ jobs:
         run: |
           set -e
           docker run -d --name opslab-ci -p 18080:18080 ops-automation-lab:ci
+          # 失败时先把容器状态和日志打出来 —— 否则只看到一个 curl 退出码，
+          # 完全看不出"是端口没监听 / 是绑了 127.0.0.1 / 还是服务崩了"
+          dump() {
+            echo "----- docker ps -----"; docker ps -a --filter name=opslab-ci
+            echo "----- docker logs -----"; docker logs opslab-ci 2>&1 | tail -20
+            echo "----- 容器内监听端口 -----"; docker exec opslab-ci python -c \
+              "import socket;s=socket.socket();print('inside bind test:');s.bind(('127.0.0.1',18080))" 2>&1 || true
+            echo "----- inspect -----"
+            docker inspect -f 'state={{.State.Status}} exit={{.State.ExitCode}} health={{if .State.Health}}{{.State.Health.Status}}{{end}}' opslab-ci 2>&1 || true
+          }
+          ok=0
           for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:18080/healthz >/dev/null; then break; fi
+            if curl -sf http://127.0.0.1:18080/healthz >/dev/null; then ok=1; break; fi
             sleep 1
           done
+          if [ "$ok" != "1" ]; then echo "服务 30s 内没起来"; dump; exit 1; fi
           curl -sf http://127.0.0.1:18080/healthz
           echo
           curl -sf http://127.0.0.1:18080/metrics | head -5
@@ -145,7 +157,9 @@ jobs:
             [ "$state" = "healthy" ] && break
             sleep 2
           done
-          test "$(docker inspect -f '{{.State.Health.Status}}' opslab-ci)" = "healthy"
+          if [ "$(docker inspect -f '{{.State.Health.Status}}' opslab-ci)" != "healthy" ]; then
+            echo "HEALTHCHECK 没变成 healthy"; dump; exit 1
+          fi
           # 优雅停机：SIGTERM 之后容器应该自己退出（退出码 0，而不是被杀）
           docker kill -s TERM opslab-ci
           for i in $(seq 1 20); do
