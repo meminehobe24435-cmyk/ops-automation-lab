@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ops-automation-lab"
+version = "1.0.0"
+description = "运维自动化与可观测性工具链：指标采集 / 告警治理 / 健康检查 / 应急预案 / 故障演练 / 滚动发布（Python 3 标准库零依赖）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "尤译庆", email = "meminehobe24435@gmail.com" }]
+keywords = ["sre", "observability", "alerting", "chaos-engineering", "rolling-deploy", "runbook"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
+# 运行时真的一个第三方依赖都没有：CI 里有一条 AST 检查会拦下任何偷偷引入的包
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+opslab = "opslab.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/meminehobe24435-cmyk/ops-automation-lab"
+Source = "https://github.com/meminehobe24435-cmyk/ops-automation-lab"
+
+[tool.setuptools]
+packages = ["opslab", "opslab.demo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 安装（运行时零依赖，只装测试用的 pytest）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: 零第三方依赖自检
+        run: python -c "import opslab,sys; print('opslab', opslab.__version__, '| 已加载的第三方库:', [m for m in ('psutil','requests','yaml','prometheus_client','flask') if m in sys.modules] or 'none')"
+
+      - name: 单元测试
+        run: python -m pytest tests -q
+
+      - name: 故障演练（5 类故障必须全部被检测并自动恢复）
+        run: python -m opslab drill --workdir reports/drill --out reports --quiet
+
+      - name: 滚动发布演练（发布期间可用性必须 100%）
+        run: python -m opslab deploy --workdir reports/deploy --out reports --quiet
+
+      - name: 坏版本演练（健康门禁必须拦停 + 自动回滚）
+        run: python -m opslab deploy --workdir reports/deploy_bad --out reports --bad --quiet
+
+      - name: 守护进程冒烟（采集 + 告警 + 通知，跑 5 轮后正常收尾）
+        run: python -m opslab watch --workdir reports/watch --ticks 5 --interval 0.1 --quiet
+
+      - name: 上传演练报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.os }}-py${{ matrix.python }}
+          path: reports/
+          if-no-files-found: warn
+
+  lint:
+    name: 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 语法编译检查
+        run: python -m compileall -q opslab tests
+
+      - name: 依赖检查（运行时只允许标准库；测试只允许 pytest）
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+
+          # opslab/ 是发布出去的运行时，必须只用标准库；
+          # tests/ 允许 pytest，但仍禁止偷偷拉进真实监控/HTTP 库把测试喂饱。
+          runtime_forbidden = {
+              "psutil", "requests", "httpx", "aiohttp", "urllib3", "yaml", "toml",
+              "prometheus_client", "flask", "fastapi", "django", "click", "typer",
+              "rich", "tqdm", "numpy", "pandas", "docker", "kubernetes", "boto3",
+              "paramiko", "fabric", "ansible", "celery", "jinja2",
+          }
+          stdlib = set(getattr(sys, "stdlib_module_names", ()))
+          base_allowed = stdlib | {"opslab", "__future__"}
+
+          def is_bad(root: str, is_test: bool) -> bool:
+              if is_test and root in ("pytest", "conftest"):
+                  return False
+              if stdlib:                       # Python >= 3.10 有权威标准库名单
+                  return root not in base_allowed
+              return root in runtime_forbidden  # 旧解释器退化为禁止名单
+
+          runtime_files = sorted(pathlib.Path("opslab").rglob("*.py"))
+          test_files = sorted(pathlib.Path("tests").rglob("*.py"))
+          bad = []
+          for path, is_test in [(p, False) for p in runtime_files] + [(p, True) for p in test_files]:
+              tree = ast.parse(path.read_text(encoding="utf-8"))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      for alias in node.names:
+                          if is_bad(alias.name.split(".")[0], is_test):
+                              bad.append(f"{path}: import {alias.name}")
+                  elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                      if is_bad(node.module.split(".")[0], is_test):
+                          bad.append(f"{path}: from {node.module}")
+          if bad:
+              print("\n".join(bad))
+              raise SystemExit("依赖检查未通过")
+          print(f"依赖检查通过：运行时 {len(runtime_files)} 个文件仅用标准库；"
+                f"测试 {len(test_files)} 个文件仅用 pytest")
+          PY
+
+  docker:
+    name: 容器构建与容器内冒烟
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建镜像
+        run: docker build -t ops-automation-lab:ci .
+
+      - name: 非 root 用户自检
+        run: |
+          uid=$(docker run --rm --entrypoint id ops-automation-lab:ci -u)
+          echo "容器内 uid=$uid"
+          test "$uid" != "0"
+
+      - name: 容器内起服务 + HEALTHCHECK 生效 + 优雅停机
+        run: |
+          set -e
+          docker run -d --name opslab-ci -p 18080:18080 ops-automation-lab:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:18080/healthz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:18080/healthz
+          echo
+          curl -sf http://127.0.0.1:18080/metrics | head -5
+          # 等 healthcheck 变成 healthy
+          for i in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Health.Status}}' opslab-ci)
+            echo "health=$state"
+            [ "$state" = "healthy" ] && break
+            sleep 2
+          done
+          test "$(docker inspect -f '{{.State.Health.Status}}' opslab-ci)" = "healthy"
+          # 优雅停机：SIGTERM 之后容器应该自己退出（退出码 0，而不是被杀）
+          docker kill -s TERM opslab-ci
+          for i in $(seq 1 20); do
+            running=$(docker inspect -f '{{.State.Running}}' opslab-ci)
+            [ "$running" = "false" ] && break
+            sleep 1
+          done
+          code=$(docker inspect -f '{{.State.ExitCode}}' opslab-ci)
+          echo "退出码=$code"
+          docker logs opslab-ci | tail -5
+          docker rm -f opslab-ci
+          test "$code" = "0"

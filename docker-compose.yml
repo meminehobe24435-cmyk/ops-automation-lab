@@ -1,0 +1,40 @@
+# docker compose：两个容器 —— 一个是被监控的示例服务，一个是采集/告警的守护进程。
+#
+#   docker compose up --build
+#   docker compose exec ops python -m opslab check --port 18080 --count 3
+#   docker compose stop demo          # 制造故障：告警应该在 failures×interval 内触发
+#   docker compose start demo         # 恢复：告警应转为 RESOLVED
+#
+# 这两个容器之间的关系就是"被监控对象 ↔ 监控系统"，和线上是同一套语义。
+services:
+  demo:
+    build: .
+    image: ops-automation-lab:local
+    container_name: opslab-demo
+    command: ["demo-service", "--port", "18080", "--version", "compose-v1"]
+    ports:
+      - "18080:18080"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:18080/healthz',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    restart: unless-stopped
+
+  ops:
+    build: .
+    image: ops-automation-lab:local
+    container_name: opslab-ops
+    depends_on:
+      demo:
+        condition: service_healthy
+    # 采集 + 告警 + 通知（守护进程模式），日志按大小轮转到挂载卷里
+    command: ["watch", "--workdir", "/var/lib/opslab", "--ticks", "20", "--interval", "1"]
+    volumes:
+      - opslab-data:/var/lib/opslab
+    restart: "no"
+
+volumes:
+  opslab-data:

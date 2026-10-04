@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.eggs/
+reports/
+!reports/.gitkeep
+*.log
+*.log.*
+opslab.pid
+test_tmp/
+.venv/
+venv/
