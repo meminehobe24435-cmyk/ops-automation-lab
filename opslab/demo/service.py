@@ -23,11 +23,38 @@ import json
 import os
 import signal
 import socket
+import socketserver
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+
+class _Server(ThreadingHTTPServer):
+    """★ 必须绕开 `HTTPServer.server_bind()` 里的 `socket.getfqdn()`。
+
+    标准库 `HTTPServer.server_bind()` 的顺序是：
+        TCPServer.server_bind()   → socket.bind()
+        socket.getfqdn(host)      → **反向 DNS 查询**
+    而真正的 `socket.listen()` 在它**之后**的 `server_activate()` 里。
+    也就是说：**如果 getfqdn() 卡住，端口就是"已绑定但没在监听"** ——
+    客户端连接会直接拿到 ECONNREFUSED，看起来像"服务没起来"。
+
+    这个坑在**反向 DNS 慢的机器上**才暴露（macOS CI runner 就是典型）：
+    本地 Windows/Linux 秒过，macOS 上子进程要卡十几秒 → 探针一直连不上 →
+    整个故障演练在"服务起不来"这一步就红了。
+    `server_name` 只影响 Host 头与默认的 Server 头，赋成 host 本身即可。
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)   # 只做 bind()，不做 DNS 反查
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
 STATE = {
     "version": os.environ.get("OPSLAB_VERSION", "v1"),
@@ -181,8 +208,7 @@ def main(argv=None):
     if args.unhealthy:
         STATE["unhealthy"] = True
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
+    server = _Server((args.host, args.port), Handler)
     _SERVER[0] = server
     sys.stderr.write("opslab-demo %s 监听 %s:%d\n" % (STATE["version"], args.host, args.port))
     sys.stderr.flush()

@@ -130,8 +130,29 @@ class ManagedProcess(object):
         self.started_at = (clock or time.time)()
         if wait and self.port:
             if not wait_port(self.host, self.port, timeout=timeout, clock=clock):
-                raise RuntimeError("进程 %s 起来后端口 %d 仍未监听" % (self.name, self.port))
+                # ★ 报错必须带足够的信息，否则只会看到"端口没监听"，
+                #   完全分不清是"进程崩了""卡在初始化""绑错网卡"还是"端口被占"。
+                #   （真实案例：macOS 上 HTTPServer 卡在反向 DNS，日志为空、进程还活着。）
+                raise RuntimeError(
+                    "进程 %s 起来后端口 %d 仍未监听 | alive=%s exit=%s | 日志尾部：%s"
+                    % (self.name, self.port, self.alive(),
+                       None if self.proc is None else self.proc.poll(),
+                       self.log_tail()))
         return self.pid
+
+    def log_tail(self, limit: int = 400) -> str:
+        if not self.log_path or not os.path.exists(self.log_path):
+            return "(无日志)"
+        try:
+            with open(self.log_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - limit))
+                data = fh.read()
+            text = data.decode("utf-8", "replace").strip()
+            return text if text else "(日志为空)"
+        except (IOError, OSError) as exc:
+            return "(读日志失败：%s)" % exc
 
     def alive(self) -> bool:
         if self.proc is not None:

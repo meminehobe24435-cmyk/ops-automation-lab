@@ -963,6 +963,90 @@ def test_daemon_refuses_second_instance(tmp_path):
     first.pidfile.release()
 
 
+# =============================================================== 示例服务
+
+def test_demo_service_starts_without_reverse_dns(monkeypatch):
+    """回归：标准库 `HTTPServer.server_bind()` 会先 bind 再做 `socket.getfqdn()` 反向 DNS，
+    而真正的 `listen()` 在它之后 —— 反向 DNS 一慢，端口就处于"已绑定但没在监听"的状态，
+    客户端连上去是 ECONNREFUSED，表现为"服务起不来"（macOS CI 上真踩过）。
+
+    这里把 `getfqdn` 换成"一旦被调用就炸"，如果我们的服务还敢调用它，这条测试立刻失败。
+    """
+    import socket as _socket
+    from opslab.demo import service as demo
+
+    def boom(*args, **kwargs):
+        raise AssertionError("示例服务不允许做反向 DNS（getfqdn）")
+
+    monkeypatch.setattr(_socket, "getfqdn", boom)
+
+    from opslab.procs import port_open
+    server = demo._Server(("127.0.0.1", 0), demo.Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                              daemon=True)
+    thread.start()
+    try:
+        # 构造完成后端口必须已经处于"可连接"状态
+        deadline = time.time() + 3.0
+        connected = False
+        while time.time() < deadline:
+            if port_open("127.0.0.1", port, timeout=0.2):
+                connected = True
+                break
+            time.sleep(0.02)
+        assert connected, "server_bind() 之后端口就应该已经 listen()，不能卡在 DNS 上"
+        assert server.server_name == "127.0.0.1"
+        status, body = __import__("opslab.procs", fromlist=["http_get"]).http_get(
+            "127.0.0.1", port, "/healthz", 2.0)
+        assert status == 200 and '"ok"' in body
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_demo_service_drain_makes_healthz_503_and_tracks_inflight():
+    """优雅停机的语义：drain 之后 /healthz 立刻变 503（= 从 LB 摘除），但服务还在跑。"""
+    from opslab.demo import service as demo
+    from opslab.procs import http_get, http_post
+
+    demo.STATE["draining"] = False
+    demo.STATE["in_flight"] = 0
+    demo.STATE["drain_delay"] = 0.0
+    server = demo._Server(("127.0.0.1", 0), demo.Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                              daemon=True)
+    thread.start()
+    try:
+        assert http_get("127.0.0.1", port, "/healthz", 2.0)[0] == 200
+        status, _ = http_post("127.0.0.1", port, "/shutdown", 2.0)
+        assert status == 200
+        # 摘除后健康检查必须立刻 503（而不是等进程真的退出）
+        assert http_get("127.0.0.1", port, "/healthz", 2.0)[0] == 503
+        # 进程这一刻还活着（还在等在途请求清零）
+        assert server.socket.fileno() >= 0
+    finally:
+        demo.STATE["draining"] = False
+        server.shutdown()
+        server.server_close()
+
+
+def test_managed_process_error_message_includes_diagnostics(tmp_path):
+    """命令起不来时，报错必须带退出码 + 日志尾部（否则没法定位）"""
+    from opslab import procs as P
+    managed = P.ManagedProcess(
+        "boom", [sys.executable, "-c", "import sys;sys.stderr.write('my-custom-msg\\n');sys.exit(3)"],
+        port=_free_port(), log_path=str(tmp_path / "boom.log"))
+    with pytest.raises(RuntimeError) as exc:
+        managed.start(wait=True, timeout=0.6)
+    message = str(exc.value)
+    assert "仍未监听" in message
+    assert "exit=3" in message
+    assert "my-custom-msg" in message          # 子进程的输出被带进异常里
+    assert managed.log_tail()                   # 日志尾部可读
+
+
 # =============================================================== 故障注入
 
 def test_proxy_injector_rejects_double_start():
